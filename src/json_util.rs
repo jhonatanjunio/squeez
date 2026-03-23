@@ -12,6 +12,7 @@ pub fn extract_u64(json: &str, key: &str) -> Option<u64> {
     let start = json.find(&pat)? + pat.len();
     let s = json[start..].trim_start();
     let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if end == 0 { return None; }
     s[..end].parse().ok()
 }
 
