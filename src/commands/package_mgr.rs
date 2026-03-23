@@ -1,11 +1,13 @@
 use crate::commands::Handler;
-use crate::commands::generic::GenericHandler;
 use crate::config::Config;
+use crate::strategies::{smart_filter, dedup, truncation};
 
 pub struct PackageMgrHandler;
 
 impl Handler for PackageMgrHandler {
-    fn compress(&self, cmd: &str, lines: Vec<String>, config: &Config) -> Vec<String> {
-        GenericHandler.compress(cmd, lines, config)
+    fn compress(&self, _cmd: &str, lines: Vec<String>, _config: &Config) -> Vec<String> {
+        let lines = smart_filter::apply(lines);
+        let lines = dedup::apply(lines, 2);
+        truncation::apply(lines, 50, truncation::Keep::Tail)
     }
 }
