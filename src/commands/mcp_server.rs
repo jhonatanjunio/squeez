@@ -187,6 +187,11 @@ const TOOLS: &[(&str, &str, &str)] = &[
         "Current context pressure: budget used %, calls remaining, tokens_saved this session, and an actionable recommendation (ok / compact_soon / use_state_first). Call this to decide whether to /compact or save state and /clear.",
         "{\"type\":\"object\",\"properties\":{}}",
     ),
+    (
+        "squeez_enterprise_savings",
+        "Enterprise-transport mode (Bedrock/Vertex/OTEL) plus USD-saved estimate for the current session at Anthropic's public Sonnet 4.6 rate. Use this to quantify the dollar value of compression on usage-based enterprise workspaces.",
+        "{\"type\":\"object\",\"properties\":{}}",
+    ),
 ];
 
 fn tools_list_response(id: &str) -> String {
@@ -238,6 +243,7 @@ fn tools_call_response(id: &str, line: &str) -> String {
         "squeez_agent_costs" => tool_agent_costs(),
         "squeez_session_efficiency" => tool_session_efficiency(),
         "squeez_context_pressure" => tool_context_pressure(),
+        "squeez_enterprise_savings" => tool_enterprise_savings(),
         other => return error_response(id, -32602, &format!("unknown tool: {}", other)),
     };
     text_result_response(id, &text)
@@ -757,6 +763,30 @@ fn tool_session_efficiency() -> String {
     crate::economy::efficiency::format_efficiency(&score)
 }
 
+/// Enterprise transport detection + USD-saved estimate for the current session.
+fn tool_enterprise_savings() -> String {
+    let mode = crate::economy::enterprise::detect();
+    let tokens_saved = session::CurrentSession::load(&session::sessions_dir())
+        .map(|c| c.tokens_saved)
+        .unwrap_or(0);
+    let usd_sonnet = crate::economy::enterprise::estimate_usd(
+        tokens_saved,
+        crate::economy::enterprise::PricingModel::Sonnet46,
+    );
+    let usd_opus = crate::economy::enterprise::estimate_usd(
+        tokens_saved,
+        crate::economy::enterprise::PricingModel::Opus47,
+    );
+    format!(
+        "{{\"enterprise_mode\":\"{}\",\"is_enterprise\":{},\"tokens_saved_session\":{},\"usd_saved_sonnet46\":{:.6},\"usd_saved_opus47\":{:.6}}}",
+        mode.slug(),
+        mode.is_enterprise(),
+        tokens_saved,
+        usd_sonnet,
+        usd_opus,
+    )
+}
+
 /// Context pressure advisor: pressure %, calls remaining, tokens_saved, recommendation.
 fn tool_context_pressure() -> String {
     let ctx = load_ctx();
@@ -885,6 +915,7 @@ mod tests {
             "squeez_agent_costs",
             "squeez_session_efficiency",
             "squeez_context_pressure",
+            "squeez_enterprise_savings",
         ] {
             assert!(resp.contains(name), "missing tool {}", name);
         }
