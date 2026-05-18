@@ -67,6 +67,100 @@ fn extract_path_and_ext(cmd: &str) -> Option<(String, &'static str)> {
     Some((path, lang))
 }
 
+/// Returns true if the line looks like an indented signature — i.e. a
+/// signature line inside an `impl` block (Rust), a class body (Python,
+/// TypeScript, Java, Kotlin, Swift, Ruby), or any nested scope. Without
+/// this, signature-mode silently drops every method on a large source file
+/// because top-level matching only sees the enclosing `impl`/`class` line.
+fn is_indented_signature(line: &str, lang: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.len() == line.len() {
+        // Not indented at all — let `is_signature` handle the top-level case.
+        return false;
+    }
+    if trimmed.is_empty() {
+        return false;
+    }
+    match lang {
+        "ts" => {
+            // Class-member shapes (positive list — these never appear at file
+            // top level, so they're safe to match only here).
+            const TS_MEMBER_PREFIXES: &[&str] = &[
+                "public ",
+                "private ",
+                "protected ",
+                "static ",
+                "async ",
+                "get ",
+                "set ",
+                "readonly ",
+                "abstract ",
+                "override ",
+            ];
+            if TS_MEMBER_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+                return true;
+            }
+            // Body-content veto: these prefixes are valid at the top level
+            // (`export const`, `type Foo = ...`) but inside a method body
+            // they're just local-variable declarations.
+            const BODY_PREFIXES: &[&str] = &[
+                "const ",
+                "let ",
+                "var ",
+                "type ",
+                "interface ",
+                "enum ",
+            ];
+            if BODY_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+                return false;
+            }
+        }
+        "java" | "kotlin" => {
+            // Same idea: class-member visibility/modifier keywords are
+            // already in the top-level matcher; keep that working when
+            // indented too. Nothing extra to do.
+        }
+        _ => {}
+    }
+    is_signature(trimmed, lang)
+}
+
+/// Returns true if the line is a doc-comment, decorator, or attribute that
+/// belongs to the *next* declaration. Signature-mode preserves the most
+/// recent such run immediately above each kept signature, because they
+/// carry intent, derives, decorators, and overload hints — exactly what
+/// the LLM needs to avoid re-reading the file.
+fn is_doc_or_attribute(line: &str, lang: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    match lang {
+        "rust" => {
+            trimmed.starts_with("///")
+                || trimmed.starts_with("//!")
+                || trimmed.starts_with("#[")
+                || trimmed.starts_with("#![")
+        }
+        "python" => {
+            trimmed.starts_with("@")
+                || trimmed.starts_with("#")
+                || trimmed.starts_with("\"\"\"")
+                || trimmed.starts_with("'''")
+        }
+        "ts" | "java" | "kotlin" | "c" => {
+            trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with("*")
+                || trimmed.starts_with("@")
+        }
+        "go" => trimmed.starts_with("//"),
+        "ruby" => trimmed.starts_with("#"),
+        "swift" => trimmed.starts_with("///") || trimmed.starts_with("//"),
+        _ => false,
+    }
+}
+
 /// Returns true if the line looks like a signature for the given language.
 fn is_signature(line: &str, lang: &str) -> bool {
     match lang {
@@ -164,7 +258,10 @@ fn is_signature(line: &str, lang: &str) -> bool {
     }
 }
 
-/// Compress to signature lines, preserving first-3 and last-3 verbatim.
+/// Compress to signature lines, preserving first-3 and last-3 verbatim,
+/// plus indented method signatures inside `impl`/`class` blocks and the
+/// doc-comment / attribute / decorator run that immediately precedes each
+/// kept signature.
 fn compress_signatures(lines: Vec<String>, lang: &str) -> Vec<String> {
     let total = lines.len();
     let anchor_count = 3.min(total / 2); // don't overlap on tiny files
@@ -172,15 +269,34 @@ fn compress_signatures(lines: Vec<String>, lang: &str) -> Vec<String> {
     let first_lines: Vec<String> = lines[..anchor_count].to_vec();
     let last_lines: Vec<String> = lines[total.saturating_sub(anchor_count)..].to_vec();
 
-    let sig_lines: Vec<String> = lines
-        .iter()
-        .filter(|l| is_signature(l.as_str(), lang))
-        .cloned()
-        .collect();
+    let head_end = anchor_count;
+    let tail_start = total.saturating_sub(anchor_count);
 
-    let mut out = Vec::with_capacity(anchor_count * 2 + sig_lines.len());
+    let mut middle: Vec<String> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i < head_end || i >= tail_start {
+            // Anchors carry their own context — no need to buffer doc lines.
+            pending.clear();
+            continue;
+        }
+        let s = line.as_str();
+        if is_doc_or_attribute(s, lang) {
+            pending.push(line.clone());
+            continue;
+        }
+        if is_signature(s, lang) || is_indented_signature(s, lang) {
+            middle.extend(pending.drain(..));
+            middle.push(line.clone());
+            continue;
+        }
+        // Any non-doc, non-signature line breaks the accumulating context.
+        pending.clear();
+    }
+
+    let mut out = Vec::with_capacity(anchor_count * 2 + middle.len());
     out.extend(first_lines);
-    out.extend(sig_lines);
+    out.extend(middle);
     out.extend(last_lines);
     out
 }
