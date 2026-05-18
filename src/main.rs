@@ -43,6 +43,9 @@ fn main() {
             let rest: Vec<String> = args.iter().skip(2).cloned().collect();
             std::process::exit(squeez::commands::compress_md::run(&rest));
         }
+        Some("compress-prompt") => {
+            std::process::exit(squeez::commands::compress_prompt::run());
+        }
         Some("setup") => {
             let rest: Vec<String> = args.iter().skip(2).cloned().collect();
             std::process::exit(squeez::commands::setup::run_with_help(&rest));
@@ -62,6 +65,10 @@ fn main() {
         Some("track-result") => {
             let tool = args.get(2).map(String::as_str).unwrap_or("unknown");
             std::process::exit(squeez::commands::track_result::run(tool));
+        }
+        Some("compress-output") => {
+            let tool = args.get(2).map(String::as_str).unwrap_or("unknown");
+            std::process::exit(squeez::commands::compress_output::run(tool));
         }
         Some("mcp") => {
             // JSON-RPC 2.0 server over stdin/stdout, exposing read-only access

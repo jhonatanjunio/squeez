@@ -39,6 +39,12 @@ pub fn run(cmd_str: &str) -> i32 {
         return passthrough(cmd_str);
     }
 
+    if config.plan_mode_passthrough
+        && std::env::var("SQUEEZ_PLAN_MODE").as_deref() == Ok("1")
+    {
+        return passthrough(cmd_str);
+    }
+
     // ── Context engine pre-pass ────────────────────────────────────────
     let sessions_dir_pp = session::sessions_dir();
     let used_tokens = session::CurrentSession::load(&sessions_dir_pp)
@@ -172,11 +178,11 @@ pub fn run(cmd_str: &str) -> i32 {
         if let Some(hit) = context::redundancy::check(&ctx, &compressed) {
             compressed = vec![match hit.similarity {
                 None => format!(
-                    "[squeez: identical to {} at bash#{} — re-run with --no-squeez]",
+                    "[squeez: identical to {} at bash#{} — output omitted]",
                     hit.short_hash, hit.call_n
                 ),
                 Some(j) => format!(
-                    "[squeez: ~{}% similar to {} at bash#{} — re-run with --no-squeez]",
+                    "[squeez: ~{}% similar to {} at bash#{} — output omitted]",
                     (j * 100.0).round() as u32,
                     hit.short_hash,
                     hit.call_n
@@ -259,7 +265,23 @@ pub fn run(cmd_str: &str) -> i32 {
         ctx.note_tool_tokens("Bash", input_tokens as u64);
         // Token economy: record burn rate
         ctx.note_burn(output_tokens as u64);
+
+        // ── Auto-curation nudges (item 1) ──────────────────────────────
+        let nudges = crate::economy::nudge::evaluate(
+            &mut ctx, cmd_str, &files, access, &errors, &config,
+        );
+        for n in &nudges {
+            println!("{}", n);
+        }
+
         ctx.save(&sessions_dir_pp);
+    }
+
+    // ── Continuous handler calibration (item 2) ────────────────────────
+    if config.handler_stats_enabled {
+        let mut stats = crate::economy::handler_stats::HandlerStats::load(&sessions_dir_pp);
+        stats.record(cmd_name, input_tokens as u64, output_tokens as u64);
+        stats.save(&sessions_dir_pp);
     }
 
     exit_code
