@@ -59,7 +59,8 @@ Builds from [crates.io](https://crates.io/crates/squeez). Requires Rust stable. 
 | **Copilot CLI** | `~/.copilot/copilot-instructions.md` | ✅ native | ✅ native | ✅ native | Restart Copilot CLI after setup |
 | **OpenCode** | `~/.config/opencode/AGENTS.md` | ✅ native | ✅ native | ✅ native | Plugin at `~/.config/opencode/plugins/squeez.js`; MCP tool calls skip hooks (upstream sst/opencode#2319) |
 | **Gemini CLI** | `~/.gemini/GEMINI.md` | ✅ native | ✅ native | 🟡 soft via `GEMINI.md` | `BeforeTool` rewrite schema pending upstream docs ([google-gemini/gemini-cli#25629](https://github.com/google-gemini/gemini-cli/issues/25629)) |
-| **Codex CLI** | `~/.codex/AGENTS.md` | ✅ native | ✅ native | 🟡 soft via `AGENTS.md` | Codex `PreToolUse` is Bash-only until upstream expands ([openai/codex#18491](https://github.com/openai/codex/issues/18491)) |
+| **Codex CLI** | `~/.codex/AGENTS.md` | ✅ native | ✅ native | 🟡 soft via `AGENTS.md` | `apply_patch` hooks landed in 0.123.0 ([#18391](https://github.com/openai/codex/pull/18391)); `updatedInput` + `read_file`/`grep` hook surface still pending ([openai/codex#18491](https://github.com/openai/codex/issues/18491)) |
+| **Pi** | `~/.pi/agent/skills/squeez/SKILL.md` | ✅ native | ✅ via skill | ✅ native | TypeScript extension at `~/.pi/agent/extensions/squeez/index.ts`; restart Pi after setup |
 
 ### Manage
 
@@ -70,7 +71,7 @@ squeez uninstall              # remove squeez entries from every detected host
 squeez uninstall --host=<slug>
 ```
 
-Slugs: `claude-code` / `copilot` / `opencode` / `gemini` / `codex`.
+Slugs: `claude-code` / `copilot` / `opencode` / `gemini` / `codex` / `pi`.
 
 After install, restart the CLI you use to pick up the new hooks.
 
@@ -104,9 +105,51 @@ squeez update --insecure  # skip checksum (not recommended)
 | **Caveman persona** | Injects an ultra-terse prompt at session start so the model responds with fewer tokens. |
 | **Memory-file compression** | `squeez compress-md` compresses CLAUDE.md / AGENTS.md / copilot-instructions.md in-place — pure Rust, zero LLM. i18n-aware: set `lang = pt` (or `--lang pt`) for pt-BR article/filler/phrase dropping and Unicode-correct matching. |
 | **Session memory** | On `SessionStart`, injects a structured summary of the previous session: files investigated, learned facts (errors + git events), completed work (builds, test passes), and next steps (unresolved errors, failing tests). Summaries carry temporal validity (`valid_from`/`valid_to`). |
-| **Token tracking** | Every `PostToolUse` result (Bash, Read, Grep, Glob) feeds a `SessionContext` so squeez knows what the agent has already seen. |
+| **Token tracking** | Every `PostToolUse` result (Bash, Read, Grep, Glob, Monitor, SubagentStop) feeds a `SessionContext` so squeez knows what the agent has already seen. Read/Grep/Glob/Monitor outputs are also rewritten via `updatedToolOutput` (Claude Code v2.1.119+) when content is redundant or oversized. |
 | **Token economy** | Sub-agent cost tracking (~200K tokens/spawn), burn rate prediction (`[budget: ~N calls left]`), session efficiency scoring, tool result size budgets. |
 | **Auto-calibration** | `squeez calibrate` runs benchmarks on install and generates an optimized `config.ini` (aggressive / balanced / conservative profiles). |
+
+---
+
+## Scope & Limits
+
+squeez optimizes what it can reach — the surfaces exposed by each host's hook API. It cannot fix token leaks outside those surfaces.
+
+### Coverage table
+
+| Surface | How | When | Supported hosts |
+|---|---|---|---|
+| **Bash stdout/stderr** | `PreToolUse` wraps command w/ 4-stage pipeline (smart-filter → dedup → grouping → truncation) | Every Bash invocation | all 5 |
+| **Read / Grep / Glob limits** | `PreToolUse` injects `limit` / `head_limit` per `read_max_lines` / `grep_max_results` | Every Read/Grep/Glob call | Claude Code, Copilot, OpenCode (hard); Gemini + Codex soft via GEMINI.md / AGENTS.md |
+| **Read / Grep / Glob / Monitor output rewrite** | `PostToolUse` runs `squeez compress-output` and returns `updatedToolOutput` when content is redundant or oversized | Claude Code v2.1.119+ | Claude Code |
+| **Agent / Task prompt** | `PreToolUse` compresses `tool_input.prompt` (markdown-aware, via `compress-prompt`) | When prompt > `agent_prompt_max_tokens` | Claude Code (post–v1.8.0) |
+| **Sub-agent output** | `SubagentStop` hook feeds `last_assistant_message` into SessionContext for cross-call dedup | On every sub-agent completion | Claude Code |
+| **Compaction lifecycle** | `PreCompact` logs the event; `PostCompact` emits a re-arm reminder so the model knows compression is still active | On context compaction | Claude Code |
+| **Session memory** | `SessionStart` injects prior session summary + file-access cache | Once per session start | all 5 |
+| **Markdown viewing** | Bash handler routes `.md` reads through `compress-md` when `auto_compress_md=true` | Viewer commands on .md paths | all 5 |
+
+### What squeez CANNOT compress
+
+**Agent/Task returned output.** No hook API surface exists to rewrite an Agent's return value. `PostToolUse updatedToolOutput` (Claude Code v2.1.119+) covers built-in tools (Read, Grep, Glob, Monitor) but not the Agent/Task result. Workaround: keep agent prompts compact (squeez compresses at dispatch time via PreToolUse), and use `squeez_agent_costs` MCP tool to monitor spawn overhead.
+
+**Skills & slash-command files.** Claude Code loads these into the system prompt before any hook fires. squeez has no visibility into session-start system prompt construction.
+
+**User's top-level prompt.** squeez runs per tool call, not on user turns.
+
+**Tools whose host doesn't expose PreToolUse / BeforeTool.** E.g. Codex `apply_patch` hooks landed in 0.123.0, but `updatedInput` is explicitly unsupported and `read_file`/`grep` still have no hook surface ([openai/codex#18491](https://github.com/openai/codex/issues/18491)) — so Read/Grep caps for Codex are soft hints in AGENTS.md, not hard injections.
+
+### Secondary wins (not compression, but token-saving)
+
+- **Cross-call redundancy dedup** — exact-hash and fuzzy-trigram collapsing across 16 recent calls (see [Context engine](#what-it-does))
+- **File-access cache** — subsequent Bash commands trimmed when re-reading a file squeez has already fingerprinted
+- **Burn-rate warnings** — `[budget: ~N calls left]` nudges so the user changes behavior before context pressure spikes
+
+### Reducing overall session cost
+
+squeez cannot automate these, but you can:
+- Fewer Agent/Task dispatches per session → use `squeez_agent_costs` to track, then refactor tasks to batch work
+- Smaller prompts injected into agents → squeez compresses them at dispatch, but smaller is better
+- Shorter CLAUDE.md / AGENTS.md files → run `squeez compress-md --ultra` to drop abbreviations and filler
 
 ---
 
@@ -115,53 +158,58 @@ squeez update --insecure  # skip checksum (not recommended)
 <!-- BENCHMARK:START -->
 Measured on macOS (Apple Silicon). Token count = `chars / 4` (matches Claude's ~4 chars/token). Run `squeez benchmark` to reproduce.
 
-### Per-scenario results — 23 scenarios × 5 iterations
+### Per-scenario results — 28 scenarios × 5 iterations
 
 | Scenario | Before | After | Reduction | Latency |
 |----------|--------|-------|-----------|---------|
-| `summarize_huge` | 82,257 tk | 420 tk | **-99%** | 55.3 ms |
-| `repetitive_output` | 4,692 tk | 37 tk | **-99%** | 194 µs |
-| `high_context_adaptive` | 4,418 tk | 52 tk | **-99%** | 764 µs |
-| `ps_aux` | 40,373 tk | 2,352 tk | **-94%** | 2.2 ms |
-| `git_log_200` | 2,692 tk | 289 tk | **-89%** | 166 µs |
-| `tsc_errors` | 731 tk | 101 tk | **-86%** | 27 µs |
-| `cargo_build_noisy` | 2,106 tk | 452 tk | **-79%** | 229 µs |
-| `docker_logs` | 665 tk | 186 tk | **-72%** | 39 µs |
-| `find_deep` | 424 tk | 134 tk | **-68%** | 72 µs |
-| `git_status` | 50 tk | 16 tk | **-68%** | 10 µs |
-| `state_first_simulation` | 182 tk | 69 tk | **-62%** | 14 µs |
-| `verbose_app_log` | 4,957 tk | 1,991 tk | **-60%** | 231 µs |
-| `npm_install` | 524 tk | 232 tk | **-56%** | 38 µs |
-| `claude_md_overhead` | 717 tk | 318 tk | **-56%** | 209 µs |
-| `crosscall_redundancy_3x` | 486 tk | 241 tk | **-50%** | 51.2 ms |
-| `ls_la` | 1,782 tk | 886 tk | **-50%** | 163 µs |
-| `env_dump` | 441 tk | 287 tk | **-35%** | 19 µs |
-| `git_copilot` | 640 tk | 421 tk | **-34%** | 87 µs |
-| `agent_heavy` | 2,306 tk | 1,564 tk | **-32%** | 320 µs |
-| `md_prose` | 187 tk | 138 tk | **-26%** | 564 µs |
-| `md_claude_md` | 316 tk | 247 tk | **-22%** | 919 µs |
-| `git_diff` | 502 tk | 497 tk | **-1%** | 35 µs |
-| `kubectl_pods` | 1,513 tk | 1,513 tk | **-0%** | 25 µs |
+| `summarize_huge` | 82,257 tk | 420 tk | **-99%** | 55.7 ms |
+| `repetitive_output` | 4,692 tk | 37 tk | **-99%** | 227 µs |
+| `xcode_build` | 1,881 tk | 17 tk | **-99%** | 73 µs |
+| `high_context_adaptive` | 4,418 tk | 52 tk | **-99%** | 845 µs |
+| `agent_directory_output` | 3,348 tk | 167 tk | **-95%** | 340 µs |
+| `ps_aux` | 40,373 tk | 2,338 tk | **-94%** | 2.8 ms |
+| `git_log_200` | 2,692 tk | 275 tk | **-90%** | 213 µs |
+| `tsc_errors` | 731 tk | 101 tk | **-86%** | 24 µs |
+| `cargo_build_noisy` | 2,106 tk | 439 tk | **-79%** | 262 µs |
+| `docker_logs` | 665 tk | 186 tk | **-72%** | 51 µs |
+| `curl_html_response` | 2,181 tk | 626 tk | **-71%** | 46 µs |
+| `find_deep` | 424 tk | 134 tk | **-68%** | 76 µs |
+| `git_status` | 50 tk | 16 tk | **-68%** | 15 µs |
+| `pytest_failures` | 3,402 tk | 1,175 tk | **-65%** | 322 µs |
+| `verbose_app_log` | 4,957 tk | 1,978 tk | **-60%** | 300 µs |
+| `npm_install` | 524 tk | 218 tk | **-58%** | 48 µs |
+| `crosscall_redundancy_3x` | 486 tk | 237 tk | **-51%** | 51.6 ms |
+| `ls_la` | 1,782 tk | 872 tk | **-51%** | 213 µs |
+| `env_dump` | 441 tk | 287 tk | **-35%** | 26 µs |
+| `git_copilot` | 640 tk | 421 tk | **-34%** | 119 µs |
+| `agent_heavy` | 2,306 tk | 1,551 tk | **-33%** | 344 µs |
+| `md_prose` | 187 tk | 138 tk | **-26%** | 772 µs |
+| `md_claude_md` | 316 tk | 247 tk | **-22%** | 1.2 ms |
+| `claude_md_overhead` | 717 tk | 635 tk | **-11%** | 24 µs |
+| `git_diff` | 502 tk | 497 tk | **-1%** | 45 µs |
+| `jest_failures` | 451 tk | 448 tk | **-1%** | 54 µs |
+| `state_first_simulation` | 182 tk | 181 tk | **-1%** | 5 µs |
+| `kubectl_pods` | 1,513 tk | 1,513 tk | **-0%** | 34 µs |
 
 ### Aggregate
 
 | Metric | Value |
 |--------|-------|
-| **Total token reduction** | **91.9%** — 152,961 tk → 12,443 tk |
-| Bash output | **-84.9%** |
+| **Total token reduction** | **90.7%** — 164,224 tk → 15,206 tk |
+| Bash output | **-84.0%** |
 | Markdown / context files | **-23.5%** |
 | Wrap / cross-call engine | **-99.2%** |
-| Quality (signal terms preserved) | **23 / 23 pass** |
-| Latency p50 (filter mode) | **4.9 ms** |
-| Latency p95 (incl. wrap/summarize) | **51 ms** |
+| Quality (signal terms preserved) | **28 / 28 pass** |
+| Latency p50 (filter mode) | **4.1 ms** |
+| Latency p95 (incl. wrap/summarize) | **52 ms** |
 
 ### Estimated cost savings — Claude Sonnet 4.6 · $3.00 / MTok input
 
 | Usage | Baseline / month | Saved / month |
 |-------|-----------------|---------------|
-| 100 calls / day | $18.00 | **$16.54 (92%)** |
-| 1,000 calls / day | $180.00 | **$165.37 (92%)** |
-| 10,000 calls / day | $1800.00 | **$1653.66 (92%)** |
+| 100 calls / day | $18.00 | **$16.33 (91%)** |
+| 1,000 calls / day | $180.00 | **$163.33 (91%)** |
+| 10,000 calls / day | $1800.00 | **$1633.32 (91%)** |
 <!-- BENCHMARK:END -->
 
 ---
@@ -323,6 +371,15 @@ burn_rate_warn_calls      = 20    # warn when < 20 calls remaining
 agent_spawn_cost          = 200000 # estimated tokens per Agent/Task spawn
 read_max_lines            = 0     # max lines injected into Read tool_input (0 = off)
 grep_max_results          = 0     # max results injected into Grep tool_input (0 = off)
+
+# ── Auto-curation nudges ──────────────────────────────────────
+nudge_enabled              = true   # emit [squeez: hint ...] markers on recurring patterns
+nudge_error_threshold      = 3      # fingerprint repeats before a nudge fires
+nudge_file_mod_threshold   = 5      # writes/creates to same path before nudge fires
+nudge_cmd_repeat_threshold = 4      # expensive-command repeats before nudge fires
+
+# ── Continuous handler calibration ────────────────────────────
+handler_stats_enabled      = true   # accumulate per-handler savings across sessions
 ```
 
 ### Adaptive intensity — Full / Ultra split
@@ -381,11 +438,14 @@ Each bash command passes through four strategies in order:
 
 ### Hooks (Claude Code & Copilot CLI)
 
-Three hooks work together automatically after install:
+Six hooks work together automatically after install on Claude Code (three on Copilot CLI):
 
-- **`PreToolUse`** — rewrites every Bash call: `git status` → `squeez wrap git status`
+- **`PreToolUse`** — rewrites every Bash call: `git status` → `squeez wrap git status`; injects Read/Grep/Glob limits; compresses Agent/Task prompts
 - **`SessionStart`** — runs `squeez init`: finalizes previous session into a memory summary, injects the persona prompt
-- **`PostToolUse`** — runs `squeez track-result`: scans every tool result (Bash, Read, Grep, Glob) for file paths and errors, feeding `SessionContext`
+- **`PostToolUse`** — tracks every tool result; rewrites Read/Grep/Glob/Monitor output via `updatedToolOutput` when content is redundant or oversized (Claude Code v2.1.119+)
+- **`SubagentStop`** *(Claude Code only)* — feeds `last_assistant_message` into SessionContext so the parent agent can dedup against what the sub-agent saw
+- **`PreCompact`** *(Claude Code only)* — logs compaction events for session efficiency metrics; allows compaction to proceed
+- **`PostCompact`** *(Claude Code only)* — emits a re-arm reminder after compaction so the model knows compression is still active
 
 ### Cross-call redundancy
 
@@ -441,6 +501,10 @@ Refresh memory manually:
 SQUEEZ_DIR=~/.copilot/squeez ~/.claude/squeez/bin/squeez init --copilot
 ```
 
+### Pi
+
+TypeScript extension installed at `~/.pi/agent/extensions/squeez/index.ts`. Pi auto-discovers extensions from that directory — no settings patching needed. Session memory is injected via a skill at `~/.pi/agent/skills/squeez/SKILL.md`; Pi includes the skill description in every system prompt and loads full instructions on demand. Unlike other hosts, Pi achieves `BUDGET_HARD` output compression via the `tool_result` event (return-patch API), not just soft hints.
+
 ---
 
 ## Local development
@@ -477,6 +541,12 @@ gh pr create --base main --title "Short title" --body "Description"
 CI runs `cargo test`, `bench/run.sh`, `bench/run_context.sh`, and `squeez benchmark` on every push and pull request.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for coding standards.
+
+---
+
+## Similar projects
+
+There is an unrelated project with the same name at [KRLabsOrg/squeez](https://github.com/KRLabsOrg/squeez). This project (claudioemmanuel/squeez) is a hook-based token compressor for AI coding CLIs.
 
 ---
 

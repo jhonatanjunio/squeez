@@ -4,9 +4,11 @@ pub trait Handler {
     fn compress(&self, cmd: &str, lines: Vec<String>, config: &Config) -> Vec<String>;
 }
 
+pub mod compress_output;
 pub mod build;
 pub mod cloud;
 pub mod compress_md;
+pub mod compress_prompt;
 pub mod data_tool;
 pub mod database;
 pub mod docker;

@@ -21,7 +21,9 @@ use super::{memory_size, HostAdapter, HostCaps};
 const PRETOOLUSE_SCRIPT: &str = include_str!("../../hooks/pretooluse.sh");
 const SESSION_START_SCRIPT: &str = include_str!("../../hooks/session-start.sh");
 const POSTTOOLUSE_SCRIPT: &str = include_str!("../../hooks/posttooluse.sh");
-const STATUSLINE_SCRIPT: &str = include_str!("../../hooks/statusline.sh");
+const SUBAGENT_STOP_SCRIPT: &str = include_str!("../../hooks/subagent-stop.sh");
+const PRECOMPACT_SCRIPT: &str = include_str!("../../hooks/precompact.sh");
+const POSTCOMPACT_SCRIPT: &str = include_str!("../../hooks/postcompact.sh");
 
 /// Patches ~/.claude/settings.json to register squeez hooks + statusline.
 /// Load-merge-write with atomic rename. Idempotent via substring match on
@@ -51,9 +53,35 @@ if not isinstance(settings, dict):
     )
     sys.exit(2)
 
+# Claude Code expects hooks at settings["hooks"][event], not top-level.
+if not isinstance(settings.get("hooks"), dict):
+    settings["hooks"] = {}
+hooks_root = settings["hooks"]
+
 def ensure_list(key):
-    if not isinstance(settings.get(key), list):
-        settings[key] = []
+    if not isinstance(hooks_root.get(key), list):
+        hooks_root[key] = []
+
+# Migrate legacy top-level entries written by earlier squeez versions.
+for _legacy_evt in ("PreToolUse", "SessionStart", "PostToolUse", "SubagentStop", "PreCompact", "PostCompact"):
+    _legacy = settings.pop(_legacy_evt, None)
+    if isinstance(_legacy, list):
+        ensure_list(_legacy_evt)
+        _existing_cmds = {
+            str(h.get("command", ""))
+            for m in hooks_root[_legacy_evt] if isinstance(m, dict)
+            for h in (m.get("hooks") or [])
+        }
+        for _m in _legacy:
+            if not isinstance(_m, dict):
+                continue
+            _cmds = [str(h.get("command", "")) for h in (_m.get("hooks") or [])]
+            if any(c in _existing_cmds for c in _cmds):
+                continue
+            hooks_root[_legacy_evt].append(_m)
+
+PRETOOLUSE_MATCHER = "Bash|Read|Grep|Glob|Agent|Task"
+PRETOOLUSE_CMD = "bash " + os.path.join(hooks_dir, "pretooluse.sh")
 
 def has_squeez(arr):
     for m in arr:
@@ -65,38 +93,78 @@ def has_squeez(arr):
             continue
     return False
 
+def find_squeez_pretooluse(arr):
+    """Return the index of an existing squeez PreToolUse entry, or -1."""
+    for i, m in enumerate(arr):
+        try:
+            for h in m.get("hooks", []):
+                if "pretooluse.sh" in str(h.get("command", "")) and "squeez" in str(h.get("command", "")):
+                    return i
+        except Exception:
+            continue
+    return -1
+
 ensure_list("PreToolUse")
-if not has_squeez(settings["PreToolUse"]):
-    settings["PreToolUse"].append({
-        "matcher": "Bash",
-        "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "pretooluse.sh")}],
+idx = find_squeez_pretooluse(hooks_root["PreToolUse"])
+if idx == -1:
+    hooks_root["PreToolUse"].append({
+        "matcher": PRETOOLUSE_MATCHER,
+        "hooks": [{"type": "command", "command": PRETOOLUSE_CMD}],
     })
+else:
+    entry = hooks_root["PreToolUse"][idx]
+    if entry.get("matcher") != PRETOOLUSE_MATCHER:
+        entry["matcher"] = PRETOOLUSE_MATCHER
+    cmd_list = entry.get("hooks", [])
+    if cmd_list and cmd_list[0].get("command") != PRETOOLUSE_CMD:
+        cmd_list[0]["command"] = PRETOOLUSE_CMD
 
 ensure_list("SessionStart")
-if not has_squeez(settings["SessionStart"]):
-    settings["SessionStart"].append({
+if not has_squeez(hooks_root["SessionStart"]):
+    hooks_root["SessionStart"].append({
         "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "session-start.sh")}],
     })
 
 ensure_list("PostToolUse")
-if not has_squeez(settings["PostToolUse"]):
-    settings["PostToolUse"].append({
+if not has_squeez(hooks_root["PostToolUse"]):
+    hooks_root["PostToolUse"].append({
         "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "posttooluse.sh")}],
     })
 
+ensure_list("SubagentStop")
+if not has_squeez(hooks_root["SubagentStop"]):
+    hooks_root["SubagentStop"].append({
+        "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "subagent-stop.sh")}],
+    })
+
+ensure_list("PreCompact")
+if not has_squeez(hooks_root["PreCompact"]):
+    hooks_root["PreCompact"].append({
+        "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "precompact.sh")}],
+    })
+
+ensure_list("PostCompact")
+if not has_squeez(hooks_root["PostCompact"]):
+    hooks_root["PostCompact"].append({
+        "hooks": [{"type": "command", "command": "bash " + os.path.join(hooks_dir, "postcompact.sh")}],
+    })
+
+# Strip any prior squeez statusLine registration. The squeez status line
+# competes with third-party HUDs (e.g. claude-hud) and provides no critical
+# information that isn't already surfaced via memory/banner. Leave non-squeez
+# statusLine entries untouched. The `statusline_bin` arg is retained for
+# backward compatibility with older installers but is no longer consumed.
+_ = statusline_bin
+import re as _re
 existing_status = settings.get("statusLine")
-existing_cmd = existing_status.get("command", "") if isinstance(existing_status, dict) else ""
-squeez_cmd = "bash " + statusline_bin
-if "squeez" not in existing_cmd:
-    if existing_cmd:
-        new_cmd = (
-            "bash -c 'input=$(cat); echo \"$input\" | { "
-            + existing_cmd.rstrip() + "; } 2>/dev/null; echo \"$input\" | "
-            + squeez_cmd + "'"
-        )
-        settings["statusLine"] = {"type": "command", "command": new_cmd}
-    else:
-        settings["statusLine"] = {"type": "command", "command": squeez_cmd}
+if isinstance(existing_status, dict):
+    existing_cmd = str(existing_status.get("command", ""))
+    if "squeez" in existing_cmd:
+        m = _re.match(r"^bash -c 'input=\$\(cat\); echo \"\$input\" \| \{ (.+); \} 2>/dev/null; echo \"\$input\" \| bash .+/statusline\.sh'$", existing_cmd)
+        if m:
+            settings["statusLine"] = {"type": "command", "command": m.group(1)}
+        else:
+            del settings["statusLine"]
 
 os.makedirs(os.path.dirname(path), exist_ok=True)
 if file_existed:
@@ -127,15 +195,30 @@ except Exception as e:
 if not isinstance(settings, dict):
     sys.exit(0)
 
-for event in ("PreToolUse", "SessionStart", "PostToolUse"):
+def _strip_squeez(arr):
+    return [
+        m for m in arr
+        if isinstance(m, dict)
+        and not any("squeez" in str(h.get("command", "")) for h in (m.get("hooks") or []))
+    ]
+
+hooks_root = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else None
+for event in ("PreToolUse", "SessionStart", "PostToolUse", "SubagentStop", "PreCompact", "PostCompact"):
+    # Current shape: settings["hooks"][event]
+    if hooks_root is not None:
+        arr = hooks_root.get(event)
+        if isinstance(arr, list):
+            hooks_root[event] = _strip_squeez(arr)
+            if not hooks_root[event]:
+                del hooks_root[event]
+    # Legacy shape: settings[event] (pre-fix installs)
     arr = settings.get(event)
     if isinstance(arr, list):
-        settings[event] = [
-            m for m in arr
-            if not any("squeez" in str(h.get("command", "")) for h in m.get("hooks", []))
-        ]
+        settings[event] = _strip_squeez(arr)
         if not settings[event]:
             del settings[event]
+if hooks_root is not None and not hooks_root:
+    del settings["hooks"]
 
 status = settings.get("statusLine")
 if isinstance(status, dict) and "squeez" in str(status.get("command", "")):
@@ -233,14 +316,23 @@ impl HostAdapter for ClaudeCodeAdapter {
         write_hook(&hooks, "pretooluse.sh", PRETOOLUSE_SCRIPT)?;
         write_hook(&hooks, "session-start.sh", SESSION_START_SCRIPT)?;
         write_hook(&hooks, "posttooluse.sh", POSTTOOLUSE_SCRIPT)?;
-        write_hook(&bin, "statusline.sh", STATUSLINE_SCRIPT)?;
+        write_hook(&hooks, "subagent-stop.sh", SUBAGENT_STOP_SCRIPT)?;
+        write_hook(&hooks, "precompact.sh", PRECOMPACT_SCRIPT)?;
+        write_hook(&hooks, "postcompact.sh", POSTCOMPACT_SCRIPT)?;
+
+        // Remove orphan statusline.sh artifacts left by earlier installs. The
+        // status line is no longer registered (see PATCH_SCRIPT) and the
+        // script file would otherwise linger across upgrades.
+        for orphan in [bin.join("statusline.sh"), hooks.join("statusline.sh")] {
+            let _ = std::fs::remove_file(&orphan);
+        }
 
         run_python(
             PATCH_SCRIPT,
             &[
                 Self::settings_path().to_str().unwrap_or(""),
                 hooks.to_str().unwrap_or(""),
-                bin.join("statusline.sh").to_str().unwrap_or(""),
+                "", // legacy positional arg (was statusline_bin); kept for compat
             ],
         )?;
         Ok(())

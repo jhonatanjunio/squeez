@@ -61,6 +61,39 @@ pub struct Config {
     /// Summary output shape: "prose" | "structured" | "auto".
     /// "auto" selects Structured when Intensity == Ultra, Prose otherwise.
     pub summary_format: String,
+    // ── Agent prompt compression ─────────────────────────────────────────────
+    /// Max token estimate for Agent/Task prompt before compression kicks in.
+    /// 0 = disabled. Default: 2000.
+    pub agent_prompt_max_tokens: usize,
+    /// Pass through all output uncompressed when SQUEEZ_PLAN_MODE=1 env var is set.
+    /// Default: true. Set to false to compress even in plan mode.
+    pub plan_mode_passthrough: bool,
+    // ── Auto-curation nudges (item 1) ────────────────────────────────────────
+    /// Emit `[squeez: hint ...]` markers when recurring patterns are detected.
+    /// Default: true.
+    pub nudge_enabled: bool,
+    /// Recurrence count at which a repeated error fingerprint triggers a nudge.
+    /// Default: 3.
+    pub nudge_error_threshold: u32,
+    /// Modification count at which a repeatedly-edited file triggers a nudge.
+    /// Default: 5.
+    pub nudge_file_mod_threshold: u32,
+    /// Repeat count at which an expensive command triggers a nudge.
+    /// Default: 4.
+    pub nudge_cmd_repeat_threshold: u32,
+    // ── Continuous handler calibration (item 2) ──────────────────────────────
+    /// Accumulate per-handler in/out token counts in handler_stats.json so
+    /// `squeez_handler_stats` can surface under/over-performers. Default: true.
+    pub handler_stats_enabled: bool,
+    // ── PostToolUse compression for Read/Edit/Write (gap fix) ────────────────
+    /// Override `summarize_threshold_lines` when the tool is Read. Default 150.
+    /// Many code files are 80-300 lines and never triggered the global default
+    /// of 300, leaving them uncompressed. Set to 0 to fall back to the global
+    /// `summarize_threshold_lines`.
+    pub read_summarize_threshold_lines: usize,
+    /// Strip the verbose `"Here's the result of running cat -n on a snippet of
+    /// the edited file:"` preamble from Edit/Write tool results. Default: true.
+    pub strip_edit_preamble: bool,
 }
 
 impl Default for Config {
@@ -105,6 +138,15 @@ impl Default for Config {
             sig_mode_threshold_lines: 400,
             memory_file_warn_tokens: 1000,
             summary_format: "auto".to_string(),
+            agent_prompt_max_tokens: 2000,
+            plan_mode_passthrough: true,
+            nudge_enabled: true,
+            nudge_error_threshold: 3,
+            nudge_file_mod_threshold: 5,
+            nudge_cmd_repeat_threshold: 4,
+            handler_stats_enabled: true,
+            read_summarize_threshold_lines: 150,
+            strip_edit_preamble: true,
         }
     }
 }
@@ -208,6 +250,30 @@ impl Config {
                             _ => "auto".to_string(),
                         };
                     }
+                    "agent_prompt_max_tokens" => {
+                        c.agent_prompt_max_tokens =
+                            v.parse().unwrap_or(c.agent_prompt_max_tokens)
+                    }
+                    "plan_mode_passthrough" => c.plan_mode_passthrough = v == "true",
+                    "nudge_enabled" => c.nudge_enabled = v == "true",
+                    "nudge_error_threshold" => {
+                        c.nudge_error_threshold =
+                            v.parse().unwrap_or(c.nudge_error_threshold)
+                    }
+                    "nudge_file_mod_threshold" => {
+                        c.nudge_file_mod_threshold =
+                            v.parse().unwrap_or(c.nudge_file_mod_threshold)
+                    }
+                    "nudge_cmd_repeat_threshold" => {
+                        c.nudge_cmd_repeat_threshold =
+                            v.parse().unwrap_or(c.nudge_cmd_repeat_threshold)
+                    }
+                    "read_summarize_threshold_lines" => {
+                        c.read_summarize_threshold_lines =
+                            v.parse().unwrap_or(c.read_summarize_threshold_lines)
+                    }
+                    "strip_edit_preamble" => c.strip_edit_preamble = v == "true",
+                    "handler_stats_enabled" => c.handler_stats_enabled = v == "true",
                     _ => {}
                 }
             }
